@@ -1,0 +1,52 @@
+{
+    "exchange": {
+        "name": "binance",
+        "api_key": "YOUR_API_KEY",
+        "api_secret": "YOUR_API_SECRET",
+        "taker_fee": 0.001
+    },
+    "symbol": "BTC/USDT",
+    "timeframe": "5m",
+    "active_strategy": "RSI_DMI",
+    "risk_management": {
+        "max_position_size": 0.02,
+        "max_positions": 2,
+        "max_drawdown": 0.1,
+        "stop_loss_percent": 0.03,
+        "take_profit_percent": 0.08,
+        "use_trailing_stop": true,
+        "trailing_stop_percent": 0.02,
+        "cooldown_period": 300,
+        "max_consecutive_losses": 3
+    },
+    "strategies": {
+        "rsi_dmi": {
+            "rsi_period": 14,
+            "rsi_oversold": 30,
+            "rsi_overbought": 70,
+            "adx_period": 14,
+            "adx_threshold": 25,
+            "use_ema_filter": true,
+            "ema_period": 50
+        },
+        "grid": {
+            "upper_price": 50000,
+            "lower_price": 40000,
+            "num_grids": 20,
+            "grid_spacing_type": "arithmetic"
+        },
+        "dca": {
+            "base_amount": 100,
+            "interval_hours": 24,
+            "use_dynamic_dca": true,
+            "price_drop_threshold": 0.05,
+            "amount_multiplier": 1.5
+        },
+        "macd": {
+            "macd_fast": 12,
+            "macd_slow": 26,
+            "macd_signal": 9,
+            "use_histogram": true
+        }
+    }
+}

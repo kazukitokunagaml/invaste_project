@@ -15,9 +15,45 @@ from typing import Dict, List, Optional, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import talib
-import yfinance as yf
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+
+# talibの代わりに簡易的な指標計算を実装
+class TechnicalIndicators:
+    @staticmethod
+    def SMA(data, period):
+        """単純移動平均"""
+        return data.rolling(window=period).mean()
+
+    @staticmethod
+    def RSI(data, period=14):
+        """RSI (Relative Strength Index)"""
+        delta = data.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+
+    @staticmethod
+    def MACD(data, fast=12, slow=26, signal=9):
+        """MACD"""
+        ema_fast = data.ewm(span=fast).mean()
+        ema_slow = data.ewm(span=slow).mean()
+        macd = ema_fast - ema_slow
+        signal_line = macd.ewm(span=signal).mean()
+        hist = macd - signal_line
+        return macd, signal_line, hist
+
+    @staticmethod
+    def BBANDS(data, period=20, std=2):
+        """ボリンジャーバンド"""
+        sma = data.rolling(window=period).mean()
+        std_dev = data.rolling(window=period).std()
+        upper = sma + (std_dev * std)
+        lower = sma - (std_dev * std)
+        return upper, sma, lower
+
 
 # ========================= データクラス =========================
 
@@ -75,18 +111,25 @@ class PriceDataProvider:
         self.current_price = 45000.0  # 初期価格
         self.price_history = []
         self.volatility = 0.02  # 2%のボラティリティ
+        self.min_price = 1000.0  # 最小価格（価格が負にならないように）
 
         if mode == "historical":
             self._load_historical_data()
 
     def _load_historical_data(self):
-        """過去データを読み込む"""
+        """過去データを読み込む（yfinanceが利用できない場合はシミュレーションモードに）"""
         try:
-            # Yahoo Financeから過去30日のデータを取得
+            import yfinance as yf
+
             ticker = yf.Ticker(self.symbol)
             self.historical_data = ticker.history(period="30d", interval="5m")
             if not self.historical_data.empty:
                 self.current_price = self.historical_data["Close"].iloc[-1]
+        except ImportError:
+            print(
+                "yfinanceがインストールされていません。シミュレーションモードで実行します。"
+            )
+            self.mode = "simulation"
         except Exception as e:
             print(f"過去データの取得エラー: {e}")
             self.mode = "simulation"
@@ -103,6 +146,9 @@ class PriceDataProvider:
                 spike = np.random.uniform(-0.03, 0.03)
                 self.current_price *= 1 + spike
 
+            # 価格が最小値を下回らないようにする
+            self.current_price = max(self.current_price, self.min_price)
+
         elif self.mode == "historical" and hasattr(self, "historical_data"):
             # 過去データを順番に返す
             if len(self.price_history) < len(self.historical_data):
@@ -118,11 +164,29 @@ class PriceDataProvider:
         if self.mode == "historical" and hasattr(self, "historical_data"):
             return self.historical_data.tail(periods)
 
+        # 十分なデータがない場合は、必要な分だけ生成
+        data_needed = max(0, periods - len(self.price_history))
+        if data_needed > 0:
+            # 初期データを生成
+            base_price = self.current_price
+            for _ in range(data_needed):
+                change = np.random.normal(0, self.volatility * 0.5)
+                base_price *= 1 + change
+                base_price = max(base_price, self.min_price)
+                self.price_history.insert(
+                    0,
+                    (
+                        datetime.now() - timedelta(minutes=5 * (data_needed - _)),
+                        base_price,
+                    ),
+                )
+
         # シミュレーションモードではランダムに生成
         data = []
-        base_price = self.current_price
+        start_idx = max(0, len(self.price_history) - periods)
 
-        for i in range(periods):
+        for i in range(start_idx, len(self.price_history)):
+            _, base_price = self.price_history[i]
             open_price = base_price
             high_price = open_price * (1 + np.random.uniform(0, 0.01))
             low_price = open_price * (1 - np.random.uniform(0, 0.01))
@@ -136,13 +200,11 @@ class PriceDataProvider:
                     "Low": low_price,
                     "Close": close_price,
                     "Volume": volume,
-                }
+                },
             )
 
-            base_price = close_price
-
         df = pd.DataFrame(data)
-        df.index = pd.date_range(end=datetime.now(), periods=periods, freq="5T")
+        df.index = pd.date_range(end=datetime.now(), periods=len(data), freq="5T")
         return df
 
 
@@ -160,6 +222,7 @@ class DemoTradingEngine:
         )
         self.fee_rate = fee_rate
         self.price_provider = PriceDataProvider(mode="simulation")
+        self.lock = threading.Lock()  # スレッドセーフティのためのロック
 
     def place_order(
         self,
@@ -170,104 +233,113 @@ class DemoTradingEngine:
         limit_price: float = None,
     ) -> Dict:
         """注文を実行"""
-        current_price = self.price_provider.get_current_price()
+        with self.lock:  # スレッドセーフにする
+            current_price = self.price_provider.get_current_price()
 
-        # 市場注文の場合はスリッページを追加
-        if order_type == "market":
-            slippage = np.random.uniform(0.0001, 0.0005)  # 0.01% - 0.05%
+            # 市場注文の場合はスリッページを追加
+            if order_type == "market":
+                slippage = np.random.uniform(0.0001, 0.0005)  # 0.01% - 0.05%
+                if side == "buy":
+                    execution_price = current_price * (1 + slippage)
+                else:
+                    execution_price = current_price * (1 - slippage)
+            else:
+                execution_price = limit_price or current_price
+
+            # 注文金額を計算
+            order_value = amount * execution_price
+            fee = order_value * self.fee_rate
+            total_cost = order_value + fee if side == "buy" else fee
+
+            # 残高チェック
+            if side == "buy" and total_cost > self.account.available_balance:
+                return {"status": "rejected", "reason": "残高不足"}
+
+            if side == "sell" and symbol not in self.account.positions:
+                return {"status": "rejected", "reason": "ポジションなし"}
+
+            # pnlを初期化
+            pnl = 0.0
+
+            # 取引を実行
             if side == "buy":
-                execution_price = current_price * (1 + slippage)
+                # 買い注文
+                self.account.current_balance -= total_cost
+                self.account.available_balance -= total_cost
+
+                # ポジションを作成または追加
+                if symbol in self.account.positions:
+                    position = self.account.positions[symbol]
+                    # 平均価格を計算
+                    total_amount = position.amount + amount
+                    position.entry_price = (
+                        position.entry_price * position.amount
+                        + execution_price * amount
+                    ) / total_amount
+                    position.amount = total_amount
+                else:
+                    self.account.positions[symbol] = DemoPosition(
+                        symbol=symbol,
+                        entry_price=execution_price,
+                        amount=amount,
+                        side="long",
+                        entry_time=datetime.now(),
+                        current_price=execution_price,
+                    )
             else:
-                execution_price = current_price * (1 - slippage)
-        else:
-            execution_price = limit_price or current_price
-
-        # 注文金額を計算
-        order_value = amount * execution_price
-        fee = order_value * self.fee_rate
-        total_cost = order_value + fee if side == "buy" else fee
-
-        # 残高チェック
-        if side == "buy" and total_cost > self.account.available_balance:
-            return {"status": "rejected", "reason": "残高不足"}
-
-        if side == "sell" and symbol not in self.account.positions:
-            return {"status": "rejected", "reason": "ポジションなし"}
-
-        # 取引を実行
-        if side == "buy":
-            # 買い注文
-            self.account.current_balance -= total_cost
-            self.account.available_balance -= total_cost
-
-            # ポジションを作成または追加
-            if symbol in self.account.positions:
+                # 売り注文
                 position = self.account.positions[symbol]
-                # 平均価格を計算
-                total_amount = position.amount + amount
-                position.entry_price = (
-                    position.entry_price * position.amount + execution_price * amount
-                ) / total_amount
-                position.amount = total_amount
-            else:
-                self.account.positions[symbol] = DemoPosition(
-                    symbol=symbol,
-                    entry_price=execution_price,
-                    amount=amount,
-                    side="long",
-                    entry_time=datetime.now(),
-                    current_price=execution_price,
-                )
-        else:
-            # 売り注文
-            position = self.account.positions[symbol]
 
-            # 損益を計算
-            pnl = (execution_price - position.entry_price) * amount - fee
+                # 売却するamountがポジションサイズを超えないようにする
+                sell_amount = min(amount, position.amount)
 
-            # 残高を更新
-            self.account.current_balance += amount * execution_price - fee
-            self.account.available_balance += amount * execution_price - fee
+                # 損益を計算
+                pnl = (execution_price - position.entry_price) * sell_amount - fee
 
-            # ポジションを更新または削除
-            if position.amount > amount:
-                position.amount -= amount
-            else:
-                del self.account.positions[symbol]
+                # 残高を更新
+                self.account.current_balance += sell_amount * execution_price - fee
+                self.account.available_balance += sell_amount * execution_price - fee
 
-        # 取引履歴に追加
-        trade = DemoTrade(
-            timestamp=datetime.now(),
-            symbol=symbol,
-            side=side,
-            price=execution_price,
-            amount=amount,
-            fee=fee,
-            pnl=pnl if side == "sell" else 0.0,
-            balance_after=self.account.current_balance,
-        )
-        self.account.trade_history.append(trade)
+                # ポジションを更新または削除
+                if position.amount > sell_amount:
+                    position.amount -= sell_amount
+                else:
+                    del self.account.positions[symbol]
 
-        # 資産履歴を更新
-        total_equity = self.calculate_total_equity()
-        self.account.equity_history.append((datetime.now(), total_equity))
+            # 取引履歴に追加
+            trade = DemoTrade(
+                timestamp=datetime.now(),
+                symbol=symbol,
+                side=side,
+                price=execution_price,
+                amount=amount if side == "buy" else sell_amount,
+                fee=fee,
+                pnl=pnl,
+                balance_after=self.account.current_balance,
+            )
+            self.account.trade_history.append(trade)
 
-        return {
-            "status": "filled",
-            "trade": trade,
-            "execution_price": execution_price,
-            "fee": fee,
-        }
+            # 資産履歴を更新
+            total_equity = self.calculate_total_equity()
+            self.account.equity_history.append((datetime.now(), total_equity))
+
+            return {
+                "status": "filled",
+                "trade": trade,
+                "execution_price": execution_price,
+                "fee": fee,
+            }
 
     def update_positions(self):
         """ポジションの未実現損益を更新"""
-        current_price = self.price_provider.get_current_price()
+        with self.lock:
+            current_price = self.price_provider.get_current_price()
 
-        for symbol, position in self.account.positions.items():
-            position.current_price = current_price
-            position.unrealized_pnl = (
-                current_price - position.entry_price
-            ) * position.amount
+            for symbol, position in self.account.positions.items():
+                position.current_price = current_price
+                position.unrealized_pnl = (
+                    current_price - position.entry_price
+                ) * position.amount
 
     def calculate_total_equity(self) -> float:
         """総資産（残高＋未実現損益）を計算"""
@@ -281,69 +353,76 @@ class DemoTradingEngine:
 
     def get_performance_metrics(self) -> Dict:
         """パフォーマンス指標を計算"""
-        if not self.account.trade_history:
-            return {
-                "total_trades": 0,
-                "win_rate": 0,
-                "total_pnl": 0,
-                "total_pnl_percent": 0,
-                "max_drawdown": 0,
-                "sharpe_ratio": 0,
-            }
+        with self.lock:
+            if not self.account.trade_history:
+                return {
+                    "total_trades": 0,
+                    "win_rate": 0,
+                    "total_pnl": 0,
+                    "total_pnl_percent": 0,
+                    "max_drawdown": 0,
+                    "sharpe_ratio": 0,
+                    "winning_trades": 0,
+                    "losing_trades": 0,
+                }
 
-        # 勝率を計算
-        winning_trades = [t for t in self.account.trade_history if t.pnl > 0]
-        losing_trades = [t for t in self.account.trade_history if t.pnl < 0]
-        total_trades = len([t for t in self.account.trade_history if t.side == "sell"])
+            # 勝率を計算
+            sell_trades = [t for t in self.account.trade_history if t.side == "sell"]
+            winning_trades = [t for t in sell_trades if t.pnl > 0]
+            losing_trades = [t for t in sell_trades if t.pnl < 0]
+            total_trades = len(sell_trades)
 
-        win_rate = len(winning_trades) / total_trades if total_trades > 0 else 0
+            win_rate = len(winning_trades) / total_trades if total_trades > 0 else 0
 
-        # 総損益を計算
-        total_pnl = sum(t.pnl for t in self.account.trade_history)
-        total_pnl_percent = (total_pnl / self.account.initial_balance) * 100
+            # 総損益を計算
+            total_pnl = sum(t.pnl for t in self.account.trade_history)
+            total_pnl_percent = (total_pnl / self.account.initial_balance) * 100
 
-        # 最大ドローダウンを計算
-        if self.account.equity_history:
-            equity_values = [e[1] for e in self.account.equity_history]
-            peak = equity_values[0]
-            max_drawdown = 0
+            # 最大ドローダウンを計算
+            if self.account.equity_history:
+                equity_values = [e[1] for e in self.account.equity_history]
+                peak = equity_values[0]
+                max_drawdown = 0
 
-            for value in equity_values:
-                peak = max(peak, value)
-                drawdown = (peak - value) / peak
-                max_drawdown = max(max_drawdown, drawdown)
-        else:
-            max_drawdown = 0
+                for value in equity_values:
+                    peak = max(peak, value)
+                    drawdown = (peak - value) / peak if peak > 0 else 0
+                    max_drawdown = max(max_drawdown, drawdown)
+            else:
+                max_drawdown = 0
 
-        # シャープレシオを計算（簡易版）
-        if len(self.account.equity_history) > 1:
-            returns = []
-            for i in range(1, len(self.account.equity_history)):
-                prev_equity = self.account.equity_history[i - 1][1]
-                curr_equity = self.account.equity_history[i][1]
-                returns.append((curr_equity - prev_equity) / prev_equity)
+            # シャープレシオを計算（簡易版）
+            if len(self.account.equity_history) > 1:
+                returns = []
+                for i in range(1, len(self.account.equity_history)):
+                    prev_equity = self.account.equity_history[i - 1][1]
+                    curr_equity = self.account.equity_history[i][1]
+                    if prev_equity > 0:
+                        returns.append((curr_equity - prev_equity) / prev_equity)
 
-            if returns:
-                avg_return = np.mean(returns)
-                std_return = np.std(returns)
-                sharpe_ratio = (
-                    (avg_return / std_return) * np.sqrt(252) if std_return > 0 else 0
-                )
+                if returns:
+                    avg_return = np.mean(returns)
+                    std_return = np.std(returns)
+                    sharpe_ratio = (
+                        (avg_return / std_return) * np.sqrt(252)
+                        if std_return > 0
+                        else 0
+                    )
+                else:
+                    sharpe_ratio = 0
             else:
                 sharpe_ratio = 0
-        else:
-            sharpe_ratio = 0
 
-        return {
-            "total_trades": total_trades,
-            "win_rate": win_rate,
-            "total_pnl": total_pnl,
-            "total_pnl_percent": total_pnl_percent,
-            "max_drawdown": max_drawdown,
-            "sharpe_ratio": sharpe_ratio,
-            "winning_trades": len(winning_trades),
-            "losing_trades": len(losing_trades),
-        }
+            return {
+                "total_trades": total_trades,
+                "win_rate": win_rate,
+                "total_pnl": total_pnl,
+                "total_pnl_percent": total_pnl_percent,
+                "max_drawdown": max_drawdown,
+                "sharpe_ratio": sharpe_ratio,
+                "winning_trades": len(winning_trades),
+                "losing_trades": len(losing_trades),
+            }
 
 
 # ========================= シンプルな取引戦略 =========================
@@ -358,32 +437,50 @@ class SimpleTradingStrategy:
 
     def calculate_indicators(self, df: pd.DataFrame) -> Dict:
         """テクニカル指標を計算"""
-        # RSI
-        rsi = talib.RSI(df["Close"], timeperiod=14)
+        if len(df) < 50:  # データが不十分な場合
+            return None
 
-        # MACD
-        macd, signal, hist = talib.MACD(df["Close"])
+        try:
+            # RSI
+            rsi = TechnicalIndicators.RSI(df["Close"], timeperiod=14)
 
-        # ボリンジャーバンド
-        upper, middle, lower = talib.BBANDS(df["Close"])
+            # MACD
+            macd, signal, hist = TechnicalIndicators.MACD(df["Close"])
 
-        # 移動平均
-        sma_20 = talib.SMA(df["Close"], timeperiod=20)
-        sma_50 = talib.SMA(df["Close"], timeperiod=50)
+            # ボリンジャーバンド
+            upper, middle, lower = TechnicalIndicators.BBANDS(df["Close"])
 
-        return {
-            "rsi": rsi.iloc[-1],
-            "macd": macd.iloc[-1],
-            "macd_signal": signal.iloc[-1],
-            "bb_upper": upper.iloc[-1],
-            "bb_lower": lower.iloc[-1],
-            "sma_20": sma_20.iloc[-1],
-            "sma_50": sma_50.iloc[-1],
-            "close": df["Close"].iloc[-1],
-        }
+            # 移動平均
+            sma_20 = TechnicalIndicators.SMA(df["Close"], 20)
+            sma_50 = TechnicalIndicators.SMA(df["Close"], 50)
+
+            # NaNチェック
+            if (
+                pd.isna(rsi.iloc[-1])
+                or pd.isna(macd.iloc[-1])
+                or pd.isna(signal.iloc[-1])
+            ):
+                return None
+
+            return {
+                "rsi": rsi.iloc[-1],
+                "macd": macd.iloc[-1],
+                "macd_signal": signal.iloc[-1],
+                "bb_upper": upper.iloc[-1],
+                "bb_lower": lower.iloc[-1],
+                "sma_20": sma_20.iloc[-1],
+                "sma_50": sma_50.iloc[-1],
+                "close": df["Close"].iloc[-1],
+            }
+        except Exception as e:
+            print(f"指標計算エラー: {e}")
+            return None
 
     def generate_signal(self, indicators: Dict) -> str:
         """取引シグナルを生成"""
+        if indicators is None:
+            return "hold"
+
         # RSI戦略
         if indicators["rsi"] < 30:
             return "buy"
@@ -406,6 +503,9 @@ class SimpleTradingStrategy:
         # 指標を計算
         indicators = self.calculate_indicators(df)
 
+        if indicators is None:
+            return None, None
+
         # シグナルを生成
         signal = self.generate_signal(indicators)
 
@@ -419,10 +519,12 @@ class SimpleTradingStrategy:
             available_capital = self.engine.account.available_balance
             position_value = available_capital * self.position_size
             current_price = self.engine.price_provider.get_current_price()
-            amount = position_value / current_price
 
-            result = self.engine.place_order(symbol, "buy", amount)
-            return result, indicators
+            if current_price > 0:  # 価格が正の値であることを確認
+                amount = position_value / current_price
+
+                result = self.engine.place_order(symbol, "buy", amount)
+                return result, indicators
 
         if signal == "sell" and has_position:
             # 売り注文
@@ -483,33 +585,49 @@ class DemoTradingGUI:
         control_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
 
         self.start_button = ttk.Button(
-            control_frame, text="取引開始", command=self.start_trading
+            control_frame,
+            text="取引開始",
+            command=self.start_trading,
         )
         self.start_button.grid(row=0, column=0, padx=5)
 
         self.stop_button = ttk.Button(
-            control_frame, text="取引停止", command=self.stop_trading, state="disabled"
+            control_frame,
+            text="取引停止",
+            command=self.stop_trading,
+            state="disabled",
         )
         self.stop_button.grid(row=0, column=1, padx=5)
 
         self.reset_button = ttk.Button(
-            control_frame, text="リセット", command=self.reset_account
+            control_frame,
+            text="リセット",
+            command=self.reset_account,
         )
         self.reset_button.grid(row=0, column=2, padx=5)
 
         # 取引間隔設定
         ttk.Label(control_frame, text="取引間隔（秒）:").grid(
-            row=1, column=0, padx=5, pady=5
+            row=1,
+            column=0,
+            padx=5,
+            pady=5,
         )
         self.interval_var = tk.StringVar(value="5")
         interval_spinbox = ttk.Spinbox(
-            control_frame, from_=1, to=60, textvariable=self.interval_var, width=10
+            control_frame,
+            from_=1,
+            to=60,
+            textvariable=self.interval_var,
+            width=10,
         )
         interval_spinbox.grid(row=1, column=1, padx=5, pady=5)
 
         # パフォーマンス指標フレーム
         metrics_frame = ttk.LabelFrame(
-            main_frame, text="パフォーマンス指標", padding="10"
+            main_frame,
+            text="パフォーマンス指標",
+            padding="10",
         )
         metrics_frame.grid(row=1, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
 
@@ -528,13 +646,19 @@ class DemoTradingGUI:
         # 取引履歴フレーム
         history_frame = ttk.LabelFrame(main_frame, text="取引履歴", padding="10")
         history_frame.grid(
-            row=2, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5
+            row=2,
+            column=0,
+            columnspan=2,
+            sticky=(tk.W, tk.E, tk.N, tk.S),
+            pady=5,
         )
 
         # スクロールバー付きのテキストウィジェット
         self.history_text = tk.Text(history_frame, height=10, width=80)
         scrollbar = ttk.Scrollbar(
-            history_frame, orient="vertical", command=self.history_text.yview
+            history_frame,
+            orient="vertical",
+            command=self.history_text.yview,
         )
         self.history_text.configure(yscrollcommand=scrollbar.set)
 
@@ -544,7 +668,11 @@ class DemoTradingGUI:
         # チャートフレーム
         chart_frame = ttk.LabelFrame(main_frame, text="資産推移チャート", padding="10")
         chart_frame.grid(
-            row=3, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5
+            row=3,
+            column=0,
+            columnspan=2,
+            sticky=(tk.W, tk.E, tk.N, tk.S),
+            pady=5,
         )
 
         # Matplotlibフィギュアを作成
@@ -558,6 +686,8 @@ class DemoTradingGUI:
         main_frame.columnconfigure(0, weight=1)
         main_frame.columnconfigure(1, weight=1)
         main_frame.rowconfigure(3, weight=1)
+        history_frame.columnconfigure(0, weight=1)
+        history_frame.rowconfigure(0, weight=1)
 
     def start_trading(self):
         """取引を開始"""
@@ -634,14 +764,15 @@ class DemoTradingGUI:
         pnl_percent = (pnl / self.engine.account.initial_balance) * 100
 
         self.balance_label.config(
-            text=f"残高: ${self.engine.account.current_balance:,.2f}"
+            text=f"残高: ${self.engine.account.current_balance:,.2f}",
         )
         self.equity_label.config(text=f"総資産: ${total_equity:,.2f}")
 
         # 損益の色を設定
         pnl_color = "green" if pnl >= 0 else "red"
         self.pnl_label.config(
-            text=f"損益: ${pnl:,.2f} ({pnl_percent:.2f}%)", foreground=pnl_color
+            text=f"損益: ${pnl:,.2f} ({pnl_percent:.2f}%)",
+            foreground=pnl_color,
         )
 
         # パフォーマンス指標を更新
