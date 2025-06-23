@@ -37,6 +37,18 @@ npm run dev
 ### 3. ブラウザでアクセス
 <http://localhost:3000> にアクセスしてください。
 
+### 4. コードチェックとビルド
+
+```bash
+npm run lint
+npm run build
+npm run test
+```
+
+すべてのコマンドが成功することを確認してください。
+
+CI 環境では `scripts/ci.sh` を利用して同じチェックを実行できます。
+
 ## 使用方法
 
 ### 基本操作
